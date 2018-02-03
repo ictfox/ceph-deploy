@@ -11,15 +11,17 @@ For special configurations, like below, are the ceph cluster info, which parsed
 by the python script.
 
 # monitor
-'''
+
+```
 [mon]
-    hosts = cloud01,cloud02, cloud03
-'''
+    hosts = cloud01, cloud02, cloud03
+```
 
 hosts: The hosts would deploy monitor on them.
 
 # osd
-'''
+
+```
 [osd]
     hosts = cloud01, cloud02, cloud03, cloud04
 
@@ -31,13 +33,15 @@ hosts: The hosts would deploy monitor on them.
     osd.cloud02.devs = sdb:sdl, sdc:sdl, sdd:sdl, sde:sdl, sdf:sdl, sdg:sdm, sdh:sdm, sdi:sdm, sdj:sdm, sdk:sdm
     osd.cloud03.devs = sdb:sdl, sdc:sdl, sdd:sdl, sde:sdl, sdf:sdl, sdg:sdm, sdh:sdm, sdi:sdm, sdj:sdm, sdk:sdm
     osd.cloud04.devs = sdb:sdl, sdc:sdl, sdd:sdl, sde:sdl, sdf:sdl, sdg:sdm, sdh:sdm, sdi:sdm, sdj:sdm, sdk:sdm
-'''
+```
 
-hosts: The hosts would deploy osds on them.
-osd.[host].devs: The host devices to deploy ceph osd
-                 For example: 'sdb:sdl' mean use 'sdb' as osd disk, 'sdl' as osd journal
+- hosts: The hosts would deploy osds on them.
+- osd.[host].devs: The host devices to deploy ceph osd
+    For example: 'sdb:sdl' mean use 'sdb' as osd disk, 'sdl' as osd journal
 
 ## Usage
+
+```
 ceph_auto_deploy.py usage:
     python ceph_auto_deploy.py     run this script with default configuration
     -h, --help                          print help message
@@ -50,6 +54,8 @@ ceph_auto_deploy.py usage:
     -r                                  do ceph purge and ceph reinstall
     --just-deploy-osds                  just do deploy ceph osds
     --debug                             just print out the commands
+```
 
 ## Deploy Ceph Cluster
-Run python script ceph_auto_deploy.py: python ceph_auto_deploy.py
+
+Run python script ceph_auto_deploy.py: `python ceph_auto_deploy.py`
