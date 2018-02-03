@@ -5,12 +5,10 @@ import sys
 import getopt
 import os
 import re
-import json
-import platform
-import pdb
-
+import io
 import threading
-import time
+from ConfigParser import ConfigParser
+config = ConfigParser()
 
 class threading_do_parallel_cmd(threading.Thread):
     def __init__(self, cmd):
@@ -41,7 +39,7 @@ def do_osds_parallel_cmd(sub_cmd, osds_list):
     return
 
 def do_local_cmd(cmd):
-    print "Do command: %s" % cmd
+    print "[CMD] %s" % cmd
     if conf_debug: return
 
     out = os.system(cmd)
@@ -74,155 +72,226 @@ def do_remote_cmd_with_return(host, cmd):
     output_list = os.popen("ssh " + host + " " + cmd).readlines()
     return output_list
 
-def get_conf_json_data(cfile):
+class Host:
+    def __init__(self, hostname):
+        self.hostname = hostname
+        self.public_network = ""
+        self.cluster_network = ""
+
+    def set_network(self, public_network, cluster_network):
+        self.public_network = public_network
+        self.cluster_network = cluster_network
+
+    def update_network_conf(self):
+        if conf_debug: return
+
+        conf = ConfigParser()
+        conf.read('ceph.conf')
+        if self.public_network:
+            conf.set("global", "public network", self.public_network)
+        if self.cluster_network:
+            conf.set("global", "cluster network", self.cluster_network)
+        with open('ceph.conf', 'wb') as cfgfile:
+            conf.write(cfgfile)
+
+class MON(Host):
+    def __init__(self, hostname):
+        Host.__init__(self, hostname)
+
+    def __str__(self):
+        return 'MON: {\n  hostname: %s,\n  public_network: %s,\n  cluster_network: %s\n}' % \
+            (self.hostname, self.public_network, self.cluster_network)
+
+    def add_mon(self):
+        print "Adding MON: %s" % self.hostname
+        self.update_network_conf()
+        do_local_cmd("ceph-deploy mon add " + self.hostname)
+
+class OSD(Host):
+    def __init__(self, hostname):
+        Host.__init__(self, hostname)
+        self.dev_list = []
+        self.path_list = []
+        self.part_list = []
+        self.journals = []
+        self.num_osds = 0
+
+    def __str__(self):
+        return 'OSD: {\n  hostname: %s,\n' % self.hostname + \
+            '  public_network: %s,\n' % self.public_network + \
+            '  cluster_network: %s,\n' % self.cluster_network + \
+            '  devices: %s,\n' % self.dev_list + \
+            '  paths: %s,\n' % self.path_list + \
+            '  partitions: %s\n}' % self.part_list
+
+    def deploy(self):
+        print "Deploying OSD: %s" % self.hostname
+        self.update_network_conf()
+
+        if self.journals:
+            journals_str = ' '.join(self.journals)
+            do_local_cmd("ceph-deploy disk zap " + journals_str)
+        if self.dev_list:
+            devs_str = ' '.join(self.dev_list)
+            do_local_cmd("ceph-deploy --overwrite-conf osd prepare --zap-disk " + devs_str)
+        if self.path_list:
+            paths_str = ' '.join(self.path_list)
+            do_local_cmd("ceph-deploy --overwrite-conf osd prepare " + paths_str)
+            do_local_cmd("ceph-deploy osd activate " + paths_str)
+        if self.part_list:
+            print "partition deployment not supported now."
+
+
+    # Set device list, should only be called once
+    def set_dev_list(self, dev_list):
+        self.dev_list = dev_list
+        self.num_osds = self.num_osds + len(dev_list)
+        # Parse the journal devices
+        for dev in dev_list:
+            # dev format: hostname:disk:journal
+            tmp = dev.split(':')
+            if len(tmp) == 3:
+                journal = self.hostname+":"+tmp[2]
+                self.journals.append(journal)
+                # Deduplicate and sort
+                self.journals = list(set(self.journals))
+                self.journals.sort()
+
+    # Set path list, should only be called once
+    def set_path_list(self, path_list):
+        self.path_list = path_list
+        self.num_osds = self.num_osds + len(path_list)
+
+    # Set partition list
+    def set_part_list(self, part_list):
+        self.part_list = part_list
+        self.num_osds = self.num_osds + len(part_list)
+
+class RGW(Host):
+    def __init__(self, hostname):
+        Host.__init__(self, hostname)
+
+    def __str__(self):
+        return 'RGW: {\n  hostname: %s,\n  public_network: %s,\n  cluster_network: %s\n}' % \
+            (self.hostname, self.public_network, self.cluster_network)
+
+    def deploy(self):
+        print "Deploying RGW: %s" % self.hostname
+        self.update_network_conf()
+        do_local_cmd("ceph-deploy rgw create " + self.hostname)
+
+def create_initial_monitors(mons_str):
+    print "Creating initial MON(s): %s" % mons_str
+    do_local_cmd("rm -rf ceph.*")
+    do_local_cmd("ceph-deploy new " + mons_str)
+    # Add user configuration to ceph.conf
+    user_configure_ceph()
+    do_local_cmd("ceph-deploy mon create-initial")
+
+def parse_deploy_conf(cfile):
+    # global mons, osds, rgws
+    conf_data = {"mon":[], "osd":[], "rgw":[]}
+
     fhandle = open(cfile, 'r')
-    fdata = fhandle.readlines()
+    raw_data = fhandle.read()
     fhandle.close()
 
-    json_data = {"mon": {}, "osd": {}, "mds": {}, "client": {}, "rgw": {}}
-    index = 0
-    for line in fdata:
-        index = index + 1
-        #print line.strip()
-        if re.search(r'\[mon\]', line, re.M|re.I):
-            hosts = re.split('=', fdata[index])
-            json_hosts = {hosts[0].strip() : hosts[1].strip()}
-            json_data["mon"] = json_hosts
-        if re.search(r'\[osd\]', line, re.M|re.I):
-            hosts = re.split('=', fdata[index])
-            json_hosts = {hosts[0].strip() : hosts[1].strip()}
-            json_data["osd"] = json_hosts
-        elif re.search(r'osd\.', line, re.M|re.I):
-            tmp = re.split('[.]', line.strip())
-            osd_host = tmp[1]
-            #print "osd host: %s" % osd_host
-            try:
-                json_osd = json_data["osd"]
-            except Exception, err:
-                json_data["osd"] = {}
-                json_osd = json_data["osd"]
-            devs = re.split('=', tmp[2])
-            #print "devs: %s" % devs
-            json_devs = {devs[0].strip() : devs[1].strip()}
-            json_osd[osd_host] = json_devs
-        elif re.search(r'client\.(images|volumes|cinder)', line, re.M|re.I):
-            tmp = re.split('[\[\]]', line.strip())
-            client = tmp[1]
-            try:
-                json_client = json_data["client"]
-            except Exception, err:
-                json_data["client"] = {}
-                json_client = json_data["client"]
-            keyring = re.split('=', fdata[index])
-            json_keyring = {keyring[0].strip() : keyring[1].strip()}
-            json_client[client] = json_keyring
-        elif re.search(r'\[rgw\]', line, re.M|re.I):
-            hosts = re.split('=', fdata[index])
-            json_hosts = {hosts[0].strip() : hosts[1].strip()}
-            json_data["rgw"] = json_hosts
+    # Remove whitespaces in cfile so ConfigParser can parse it
+    fdata = raw_data.replace("    ", "")
+    config.readfp(io.BytesIO(fdata))
 
-    #print "json_data: %s" % json_data
-    return json_data
+    section = "host-specific"
 
-def get_conf_monitors(jd):
-    tmp = ''.join(jd["hosts"].split())
-    hosts = re.split(',', tmp)
-    return hosts
+    # 1.Parse monitor hosts
+    hosts = config.get(section, "mon_hosts")
+    mon_hosts = [x.strip() for x in hosts.split(',')]
+    mons = [MON(x) for x in mon_hosts]
 
-def get_conf_host_osds(jd):
-    host_osds = {"devs": {}, "parts": {}, "paths": {}}
-    host_osds_devs = []
-    host_osds_parts = []
-    host_osds_paths = []
+    # 2.Parse OSD hosts
+    hosts = config.get(section, "osd_hosts")
+    osd_hosts = [x.strip() for x in hosts.split(',')]
+    osds = []
+    # Parse OSD devices/partitions/paths
+    for host in osd_hosts:
+        osd_dev_list = []
+        osd_path_list = []
+        osd_part_list = []
+        osd = OSD(host)
+        # Parse devices
+        if config.has_option(section, 'osd.'+host+'.devs'):
+            devs = config.get(section, 'osd.'+host+'.devs')
+            dev_list = [x.strip() for x in devs.split(',')]
+            for dev in dev_list:
+                osd_dev = host+":"+dev
+                osd_dev_list.append(osd_dev)
+            osd.set_dev_list(osd_dev_list)
+        # Parse paths
+        if config.has_option(section, 'osd.'+host+'.paths'):
+            paths = config.get(section, 'osd.'+host+'.paths')
+            path_list = [x.strip() for x in paths.split(',')]
+            for path in path_list:
+                osd_path = host+":"+path
+                osd_path_list.append(osd_path)
+            osd.set_path_list(osd_path_list)
+        # Parse partitions
+        if config.has_option(section, 'osd.'+host+'.parts'):
+            parts = config.get(section, 'osd.'+host+'.parts')
+            part_list = [x.strip() for x in parts.split(',')]
+            for part in part_list:
+                osd_part = host+":"+part
+                osd_part_list.append(osd_part)
+            osd.set_part_list(osd_part_list)
+        osds.append(osd)
 
-    tmp = ''.join(jd["hosts"].split())
-    hosts = re.split(',', tmp)
-    for host in hosts:
-        osds_devs = ""
-        osds_parts = ""
-        osds_paths = ""
-        if host == "": continue
-        if jd[host].has_key("devs"):
-            tmp = ''.join(jd[host]["devs"].split())
-            devs = re.split(',', tmp)
-            #print "%s: %s" %(host, devs)
-            # Parse disks and partitions
-            for dev in devs:
-                tmp = re.split('[:/]', dev)
-                if re.match('^[a-z]+[0-9]+$', tmp[2]):
-                    osds_parts = osds_parts + host + ":" + dev + " "
-                else:
-                    osds_devs = osds_devs + host + ":" + dev + " "
-        if jd[host].has_key("paths"):
-            # Parse paths
-            tmp = ''.join(jd[host]["paths"].split())
-            paths = re.split(',', tmp)
-            #print "%s: %s" %(host, paths)
-            for path in paths:
-                tmp = re.split('[:/]', path)
-                osds_paths = osds_paths + host + ":" + path + " "
+    # 3.Parse RGW hosts
+    if config.has_option(section, 'rgw_hosts'):
+        hosts = config.get(section, "rgw_hosts")
+        if hosts:
+            rgw_hosts = [x.strip() for x in hosts.split(',')]
+            rgws = [RGW(x) for x in rgw_hosts]
+        else:
+            rgws = []
+    else:
+        rgws = []
 
-        #print "osds_devs: %s" % osds_devs
-        #print "osds_parts: %s" % osds_parts
-        #print "osds_paths: %s" % osds_paths
-        if osds_devs != "":
-            host_osds_devs.append(osds_devs.strip())
-        if osds_parts != "":
-            host_osds_parts.append(osds_parts.strip())
-        if osds_paths != "":
-            host_osds_paths.append(osds_paths.strip())
+    # 4.Parse network settings
+    # "public-network;cluster-network" : [host1, host2, host3],
+    # "public-network;cluster-network" : [host4, host5]
+    net_conf = re.compile(r"(1?\d\d?|2[0-4]\d|25[0-5])\.(1?\d\d?|2[0-4]\d|25[0-5])\."+
+                          "(1?\d\d?|2[0-4]\d|25[0-5])\.(1?\d\d?|2[0-4]\d|25[0-5])/\d\d?;"+
+                          "(1?\d\d?|2[0-4]\d|25[0-5])\.(1?\d\d?|2[0-4]\d|25[0-5])\."+
+                          "(1?\d\d?|2[0-4]\d|25[0-5])\.(1?\d\d?|2[0-4]\d|25[0-5])/\d\d?$")
+    options = config.options(section)
+    for option in options:
+        if re.match(net_conf, option) == None:
+            continue
+        tmp = [x.strip() for x in option.split(';')]
+        public_network = tmp[0]
+        cluster_network = tmp[1]
+        hosts = config.get(section, option)
+        host_set = set([x.strip() for x in hosts.split(',')])
+        for mon in mons:
+            if mon.hostname in host_set:
+                mon.set_network(public_network, cluster_network)
+        for osd in osds:
+            if osd.hostname in host_set:
+                osd.set_network(public_network, cluster_network)
+        for rgw in rgws:
+            if rgw.hostname in host_set:
+                rgw.set_network(public_network, cluster_network)
 
-    host_osds["devs"] = host_osds_devs
-    host_osds["parts"] = host_osds_parts
-    host_osds["paths"] = host_osds_paths
-    return host_osds
+    conf_data["mon"] = mons
+    conf_data["osd"] = osds
+    conf_data["rgw"] = rgws
 
-def get_conf_mdss(jd):
-    if not jd:
-        print "no mds configured in configure file"
-        return
+    return conf_data
 
-    return
 
-def get_conf_rgws(jd):
-    if not jd:
-        print "no rgw configured in configure file"
-        return
-    if jd.has_key("hosts"):
-        tmp = ''.join(jd["hosts"].split())
-        hosts = re.split(',', tmp)
-        return hosts
-    return
-
-def get_osds_num(osds_list):
-    nums = 0
-    for osds in osds_list["devs"]:
-        nums = nums + len(re.split('\s', osds))
-    for osds in osds_list["parts"]:
-        nums = nums + len(re.split('\s', osds))
-    print "nums: %d" % nums
+def get_osds_num():
+    num = 0
+    for osd in osds:
+        num = num + osd.num_osds
     return nums
-
-def init_conf_keyrings(jd, ceph_hosts):
-    if not jd:
-        print "no keyring configured in configure file"
-        return
-
-    conf_ceph_hosts = just_get_conf_hosts(ceph_hosts)
-    #print "jd: %s" % jd
-    for keyring in jd:
-        kr_file = jd[keyring]["keyring"]
-
-        do_local_cmd("ceph-authtool --create-keyring " + kr_file)
-        do_local_cmd("ceph-authtool " + kr_file + " -n " + keyring + " --gen-key")
-        do_local_cmd("ceph-authtool " + kr_file + " -n " + keyring + " --cap osd 'allow *' --cap mon 'allow rw' --cap mds 'allow r'")
-        do_local_cmd("ceph auth add " + keyring + " -i " + kr_file)
-
-        # Copy keyring files to all hosts
-        for host in conf_ceph_hosts:
-            do_local_cmd("scp " + kr_file + " " + host + ":" + kr_file)
-
-    return
 
 def usage(name):
     print "%s usage:" % name
@@ -230,19 +299,16 @@ def usage(name):
     print "    -h, --help                          print help message"
     print "    -v, --version                       print script version"
     print "    -c [configure file]                 specify the configure file"
-    print "    -d [ceph deb packages dir]          specify the ceph deb packages directory"
-    print "    -j [osd journal path]               specify the osd journal file path"
-    print "    -o [osd_host:osd_host:...]          just deploy the osds on this hosts"
     print "    -p                                  just purge older ceph and ceph data"
     print "    -r                                  do ceph purge and ceph reinstall"
     print "    --just-deploy-osds                  just do deploy ceph osds"
     print "    --debug                             just print out the commands"
 
 def version():
-    print "version 1.0"
+    print "version 2.0"
 
 def get_suitable_pgnum(osds, pools, replicas):
-    pgnum = get_osds_num(osds) * 100 / (replicas * pools)
+    pgnum = get_osds_num() * 100 / (replicas * pools)
     loops = 0
     while (pgnum != 0):
         pgnum = pgnum >> 1
@@ -251,64 +317,10 @@ def get_suitable_pgnum(osds, pools, replicas):
     pgnum = 2 ** loops
     return pgnum
 
-def clear_conf_jnl_data(hosts):
-    for host in hosts:
-        do_remote_cmd(host, "mkdir -p " + conf_jnl_path)
-        do_remote_cmd(host, "rm -rf " + conf_jnl_path + "/osd*")
-        do_remote_cmd(host, "rm -rf " + conf_jnl_path + "/*journal")
-    return
-
-def purge_older_ceph(hosts):
-    conf_hosts_list = just_get_conf_hosts(hosts)
-
-    # Check which host need purge ceph
-    print "purge hosts: %s" % conf_hosts_list
-    hosts_str = ' '.join(conf_hosts_list)
-    do_local_cmd("ceph-deploy purge " + hosts_str)
-    do_local_cmd("ceph-deploy purgedata " + hosts_str)
-
-    if conf_jnl_path != "":
-        clear_conf_jnl_data(conf_hosts_list)
-
-    return
-
-def install_ceph_with_pkgs(hosts):
-    conf_hosts_list = just_get_conf_hosts(hosts)
-
-    # Check ceph package directory and do prepare.sh if needed
-    for host in conf_hosts_list:
-        output_list = do_remote_cmd_with_return(host, "'ls " + conf_ceph_pkg_dir + "* | grep prepare.sh'")
-        if output_list:
-            continue
-
-        ceph_pkg_tar_file = os.path.basename(conf_ceph_pkg_dir) + ".tar.gz"
-        output_list = do_remote_cmd_with_return(host, "'ls " + conf_ceph_pkg_dir + ".tar.gz'")
-        if conf_debug or output_list:
-            do_remote_cmd(host, "'cd " + os.path.dirname(conf_ceph_pkg_dir) + "; tar -zxf " + ceph_pkg_tar_file + "'")
-            do_remote_cmd(host, "'cd " + conf_ceph_pkg_dir + "; bash prepare.sh'")
-        else:
-            print "Could not find ceph deb packages in %s" % conf_ceph_pkg_dir
-            sys.exit(1)
-
+def install_ceph_with_cmd(ceph_hosts):
     # Reinstall ceph on hosts with multiple threading
     threads = []
-    for host in conf_hosts_list:
-        threads.append(threading_do_parallel_cmd("ssh " + host + " 'cd " + conf_ceph_pkg_dir + "; bash install.sh'"))
-
-    # Start all the threads
-    for t in threads:
-        t.start()
-
-    # Waiting for all the threads to terminate
-    for t in threads:
-        t.join()
-
-    return
-
-def install_ceph_with_cmd(hosts):
-    # Reinstall ceph on hosts with multiple threading
-    threads = []
-    for host in just_get_conf_hosts(hosts):
+    for host in ceph_hosts:
         threads.append(threading_do_parallel_cmd("ssh " + host + " '" + install_ceph_cmd + "'"))
 
     # Start all the threads
@@ -319,195 +331,118 @@ def install_ceph_with_cmd(hosts):
     for t in threads:
         t.join()
 
+def purge_older_ceph(ceph_hosts, need_confirm):
+    if need_confirm:
+        print "CAUTION: we are about to purge ceph on these hosts:"
+        for host in ceph_hosts:
+            print host
+        confirm = raw_input("\nConfirm? y/n: ")
+    else:
+        confirm = "y"
+
+    if confirm != "y":
+        print "Not confirmed, exit!"
+        sys.exit(1)
+
+    hosts_str = ' '.join(ceph_hosts)
+    do_local_cmd("ceph-deploy purge " + hosts_str)
+    do_local_cmd("ceph-deploy purgedata " + hosts_str)
+
     return
 
 def user_configure_ceph():
     do_local_cmd("sed -i 's/cephx/none/g' ceph.conf")
-    do_local_cmd("sed -i '2,$s/^/    /g' ceph.conf")
     do_local_cmd("sed -e '1d' " + conf_ceph_file + " >> ceph.conf")
-    do_local_cmd("sed -i 's/\/osd-journal-path/" + conf_jnl_path.replace('/', '\/') + "/g' ceph.conf")
+    conf = ConfigParser()
+    conf.read('ceph.conf')
+    # Remove our customer sections
+    conf.remove_section("host-specific")
+    # Get RGW host list from deploy.conf and add rgw_host to client section in ceph.conf
+    if config.has_option("host-specific", "rgw_hosts"):
+        hosts = config.get("host-specific", "rgw_hosts")
+        if hosts:
+            conf.set("client", "rgw_host", hosts)
+
+    with open('ceph.conf', 'wb') as cfgfile:
+        conf.write(cfgfile)
     return
 
-osd_num = 0
-def append_jnl_path_with_osdid(osd_devs_path):
-    global osd_num
-    jnl_path = conf_jnl_path + "/osd" + str(osd_num)
-    osd_num = osd_num + 1
-
-    osd_host = re.split(':', osd_devs_path)[0]
-    do_remote_cmd(osd_host, "mkdir -p " + jnl_path)
-
-    return osd_devs_path + ":" + jnl_path + "/journal"
-
-def append_jnl_path_with_devs(osd_devs_path):
-    dev_basename = os.path.basename(re.split(':', osd_devs_path)[1])
-    return osd_devs_path + ":" + conf_jnl_path + "/" + dev_basename + "-journal"
-
-def ceph_deploy_osd_with_journal(cmd, osds_list):
-    print "Deploy osd with journal path: %s" % conf_jnl_path
-    osds_list_with_jnl = []
-    for osds in osds_list:
-        if conf_journal_with_osdid:
-            osdlist = map(append_jnl_path_with_osdid, re.split(' ', osds))
-            # Create ceph osd
-            do_local_cmd(cmd + ' '.join(osdlist))
-        else:
-            osdlist = map(append_jnl_path_with_devs, re.split(' ', osds))
-            osds_list_with_jnl.append(' '.join(osdlist))
-            if not conf_do_osd_deploy_parallel:
-                do_local_cmd(cmd + ' '.join(osdlist))
-
-    # Do parallel deploy ceph osd if not configure journal with osdid
-    if conf_do_osd_deploy_parallel and (not conf_journal_with_osdid):
-        do_osds_parallel_cmd(cmd, osds_list_with_jnl)
-
-    return
-
-def ceph_deploy_osd(cmd, osds_list):
-    if conf_jnl_path != "":
-        ceph_deploy_osd_with_journal(cmd, osds_list)
-        return
-
-    # Without journal path configured
-    if conf_do_osd_deploy_parallel:
-        do_osds_parallel_cmd(cmd, osds_list)
+def ceph_deploy(mons, osds, rgws, need_confirm):
+    if need_confirm:
+        print "CAUTION: we are about to deploy ceph on these hosts:"
+        print "\nMONs:"
+        for mon in mons:
+            print mon.hostname
+        print "\nOSDs:"
+        for osd in osds:
+            print osd.hostname
+        print "\nRGWs:"
+        for rgw in rgws:
+            print rgw.hostname
+        confirm = raw_input("\nConfirm? y/n: ")
     else:
-        for osds in osds_list:
-            do_local_cmd(cmd + osds)
+        confirm = "y"
 
-    return
+    if confirm != "y":
+        print "Not confirmed, exit!"
+        sys.exit(1)
 
-def just_get_conf_hosts(osds_list):
-    conf_hosts_list = []
-    if conf_osd_hosts != "":
-        for osds in osds_list:
-            osd_host = re.split(':', osds)[0]
-            if osd_host in conf_osd_hosts:
-                conf_hosts_list.append(osds)
-    else:
-        for osds in osds_list:
-            conf_hosts_list.append(osds)
-
-    return conf_hosts_list
-
-def ceph_deploy(mons_list, mdss_list, osds_list, rgws_list, ceph_hosts):
     # Do not deploy monitor if option --just-deploy-osds set
     if not conf_jdo:
-        do_local_cmd("rm -rf ceph.*")
-        ### Deploy monitors
-        mons_str = ' '.join(mons_list)
-        #print "mons_str: %s" % mons_str
-        do_local_cmd("ceph-deploy new " + mons_str)
+        # Deploy MONs
+        mons_str = ""
+        for mon in mons:
+            mons_str = mons_str + ' ' + mon.hostname
+        create_initial_monitors(mons_str)
+    # Deploy OSDs
+    for osd in osds:
+        osd.deploy()
+    # Deploy RGWs
+    if not conf_jdo:
+        for rgw in rgws:
+            rgw.deploy()
 
-        # Add user configure to ceph.conf
-        user_configure_ceph()
-
-        do_local_cmd("ceph-deploy mon create-initial")
-        create_dir_for_rbd(ceph_hosts)
-
-    ### Add osds to ceph cluster
-    deploy_osd_cmd = "ceph-deploy --overwrite-conf osd create "
-    output_list = do_local_cmd_with_return("ceph-deploy osd create -h | grep '\--zap-disk'")
-    if output_list:
-        deploy_osd_cmd_with_zapdisk = "ceph-deploy --overwrite-conf osd create --zap-disk "
-    else:
-        deploy_osd_cmd_with_zapdisk = "ceph-deploy --overwrite-conf osd create "
-
-    # Just keep the osds which owner in the conf_osd_hosts
-    conf_osds_list_devs = just_get_conf_hosts(osds_list["devs"])
-    conf_osds_list_parts = just_get_conf_hosts(osds_list["parts"])
-    conf_osds_list_paths = just_get_conf_hosts(osds_list["paths"])
-
-    if conf_osds_list_devs:
-        ceph_deploy_osd(deploy_osd_cmd_with_zapdisk, conf_osds_list_devs)
-
-    if conf_osds_list_parts:
-        ceph_deploy_osd(deploy_osd_cmd, conf_osds_list_parts)
-        # Activate osds which device just one partion of disk
-        do_osds_parallel_cmd("ceph-deploy osd activate ", conf_osds_list_parts)
-
-    if conf_osds_list_paths:
-        ceph_deploy_osd("ceph-deploy --overwrite-conf osd prepare ", conf_osds_list_paths)
-        do_osds_parallel_cmd("ceph-deploy osd activate ", conf_osds_list_paths)
-
-    ### Add mdss to the cluster
-
-    ### Add rgws to the cluster
-    if rgws_list:
-        rgws_str = ' '.join(rgws_list)
-        do_local_cmd("ceph-deploy rgw create " + rgws_str)
-
-    # Copy ceph related files to hosts
-    do_local_cmd("ceph-deploy --overwrite-conf admin " + ' '.join(ceph_hosts))
-
-    # Copy ceph.conf to remote host(s)
-    do_local_cmd("ceph-deploy --overwrite-conf config push " + ' '.join(ceph_hosts))
-
-    return
-
-def create_app_pools(pools, pgnum):
-    for pool in pools:
-        do_local_cmd("ceph osd pool create " + pool + " " + str(pgnum))
-    return
-
-def create_dir_for_rbd(ceph_hosts):
-    for host in ceph_hosts:
-        do_remote_cmd(host, "mkdir -p /var/run/ceph/ceph-client")
-        do_remote_cmd(host, "chmod 777 /var/run/ceph/ceph-client")
     return
 
 def do_ceph_deploy_main(purge_reinstall):
     print "conf_ceph_file = %s" % conf_ceph_file
     if not os.path.exists(conf_ceph_file):
-        print "Could NOT find configure file: %s" % conf_ceph_file
+        print "Error could NOT find configure file: %s" % conf_ceph_file
         sys.exit(1)
 
-    # Get ceph configuration
-    json_data = get_conf_json_data(conf_ceph_file)
-    mons_list = get_conf_monitors(json_data["mon"])
-    osds_list = get_conf_host_osds(json_data["osd"])
-    mdss_list = get_conf_mdss(json_data["mds"])
-    rgws_list = get_conf_rgws(json_data["rgw"])
-    #print "mons_list: %s" % mons_list
-    #print "osds_list: %s" % osds_list
-    #print "mdss_list: %s" % mdss_list
-    #print "rgws_list: %s" % rgws_list
-
-    # Purge older ceph and reinstall
-    tmp = ''.join(json_data["osd"]["hosts"].split())
-    osd_hosts = re.split(',', tmp)
-    ceph_hosts = mons_list[:]
-    ceph_hosts.extend(osd_hosts)
-    if rgws_list:
-        ceph_hosts.extend(rgws_list)
-    # Remove duplicated hosts
-    ceph_hosts = list(set(ceph_hosts))
-    ceph_hosts.sort()
+    # Parse deploy configuration
+    conf_data = parse_deploy_conf(conf_ceph_file)
 
     # Do Ceph purge or reinstall requests
+    hosts = []
+    if not conf_jdo:
+        for host in conf_data["mon"]:
+            if host.hostname not in hosts:
+                hosts.append(host.hostname)
+        for host in conf_data["rgw"]:
+            if host.hostname not in hosts:
+                hosts.append(host.hostname)
+
+    for host in conf_data["osd"]:
+        if host.hostname not in hosts:
+            hosts.append(host.hostname)
+
     if purge_reinstall == "purge":
-        purge_older_ceph(ceph_hosts)
-        return
-    if purge_reinstall == "reinstall":
-        purge_older_ceph(ceph_hosts)
-        #install_ceph_with_pkgs(ceph_hosts)
-        install_ceph_with_cmd(ceph_hosts)
-        return
+        purge_older_ceph(hosts, need_confirm)
+    elif purge_reinstall == "reinstall":
+        purge_older_ceph(hosts, need_confirm)
+        install_ceph_with_cmd(hosts)
+    else:
+        ceph_deploy(conf_data["mon"], conf_data["osd"],
+                    conf_data["rgw"], need_confirm)
+    return
 
-    # Deploy ceph with the configuration
-    ceph_deploy(mons_list, mdss_list, osds_list, rgws_list, ceph_hosts)
-
-    # Create keyrings and pools used by apps
-    #if not conf_jdo:
-    #    init_conf_keyrings(json_data["client"], ceph_hosts)
-    #    pgnum = get_suitable_pgnum(osds_list, len(app_pools), ceph_replicas)
-    #    create_app_pools(app_pools, pgnum)
 
 def main(argv):
-    global conf_debug, conf_ceph_file, conf_ceph_pkg_dir, conf_jnl_path, conf_osd_hosts, conf_jdo
+    global conf_debug, conf_ceph_file, conf_jdo, need_confirm
 
     try:
-        opts, args = getopt.getopt(argv[1:], 'hvprc:d:j:o:', ['help', 'version', 'debug', 'just-deploy-osds'])
+        opts, args = getopt.getopt(argv[1:], 'hvprc:y', ['help', 'version', 'debug', 'just-deploy-osds'])
     except getopt.GetoptError, err:
         print str(err)
         usage(argv[0])
@@ -523,18 +458,15 @@ def main(argv):
             sys.exit(0)
         elif op == '-c':
             conf_ceph_file = value
-        elif op == '-d':
-            conf_ceph_pkg_dir = value
-        elif op == '-j':
-            conf_jnl_path = value
-        elif op == '-o':
-            conf_osd_hosts = re.split(':', value)
         elif op == '-p':
             purge_reinstall = "purge"
         elif op == '-r':
             purge_reinstall = "reinstall"
+        elif op == '-y':
+            need_confirm = False
         elif op in ('--debug'):
             conf_debug = True
+            need_confirm = False
         elif op in ('--just-deploy-osds'):
             conf_jdo = True
         else:
@@ -547,16 +479,9 @@ def main(argv):
 # Configuration of this script
 conf_debug = False
 conf_jdo = False
-conf_journal_with_osdid = False
-conf_do_osd_deploy_parallel = False
 conf_ceph_file = "deploy.conf"
-conf_ceph_pkg_dir = "/opt/osdeploy/deploy/src/ceph/ceph-debpkgs"
-conf_jnl_path = ""
-conf_osd_hosts = ""
-
-install_ceph_cmd = "yum install -y ceph ceph-common ceph-radosgw"
-app_pools = ["images", "volumes", "backups", "vms"]
-ceph_replicas = 3
+need_confirm = True
+install_ceph_cmd = "apt-get install -y ceph radosgw ceph-mds"
 
 if __name__ == '__main__':
     main(sys.argv)
